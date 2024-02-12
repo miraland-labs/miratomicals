@@ -103,28 +103,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "atomicalsir"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "array-bytes",
- "atomicals-electrumx",
- "bitcoin",
- "ciborium",
- "clap",
- "color-eyre",
- "num_cpus",
- "rand",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "vergen",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -799,6 +777,28 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "miratomicals"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "array-bytes",
+ "atomicals-electrumx",
+ "bitcoin",
+ "ciborium",
+ "clap",
+ "color-eyre",
+ "num_cpus",
+ "rand",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vergen",
 ]
 
 [[package]]

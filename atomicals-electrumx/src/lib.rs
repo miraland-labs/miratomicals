@@ -14,17 +14,15 @@ pub mod util;
 pub mod prelude {
 	//! atomicals-electrumx prelude.
 
-	pub use std::result::Result as StdResult;
-
 	pub use super::error::{self, Error};
 
 	/// atomicals-electrumx `Result` type.
-	pub type Result<T> = StdResult<T, Error>;
+	pub type Result<T> = std::result::Result<T, Error>;
 }
 use prelude::*;
 
 // std
-use std::{future::Future, str::FromStr, time::Duration};
+use std::{future::Future, str::FromStr, time::Duration, collections::HashMap};
 // crates.io
 use bitcoin::{Address, Amount, Network};
 use reqwest::{Client as ReqwestClient, ClientBuilder as ReqwestClientBuilder};
@@ -45,7 +43,7 @@ pub trait Http {
 	fn post<U, P, R>(&self, uri: U, params: P) -> impl Future<Output = Result<R>> + Send
 	where
 		U: Send + Sync + AsRef<str>,
-		P: Send + Sync + Serialize,
+		P: Send + Sync + Serialize + std::fmt::Debug,
 		R: DeserializeOwned;
 }
 
@@ -216,13 +214,15 @@ impl Http for ElectrumX {
 	async fn post<U, P, R>(&self, uri: U, params: P) -> Result<R>
 	where
 		U: Send + Sync + AsRef<str>,
-		P: Send + Sync + Serialize,
+		P: Send + Sync + Serialize + std::fmt::Debug,
 		R: DeserializeOwned,
 	{
 		let u = uri.as_ref();
+		let params = HashMap::from([("params", params)]);
 
 		for _ in self.max_retries.clone() {
 			match self.client.post(u).json(&params).send().await {
+				// Ok(r) => tracing::info!("u: {u}, params: {:?}, resp json: {:?}", params, r),
 				Ok(r) => match r.json().await {
 					Ok(r) => return Ok(r),
 					Err(e) => {

@@ -24,6 +24,8 @@ use bitcoin::{
 	TxIn, TxOut, Witness,
 };
 use serde::Serialize;
+use tokio::time;
+
 // atomicalsir
 use crate::{
 	prelude::*,
@@ -33,14 +35,15 @@ use crate::{
 use atomicals_electrumx::{r#type::Utxo, Api, ElectrumX, ElectrumXBuilder};
 
 pub async fn run(
-	thread: u16,
+	num_threads: u16,
 	network: Network,
 	fee_bound: &FeeBound,
 	electrumx: &str,
 	wallet_dir: &Path,
 	ticker: &str,
+	current: bool,
 ) -> Result<()> {
-	let m = MinerBuilder { thread, network, fee_bound, electrumx, wallet_dir, ticker }.build()?;
+	let m = MinerBuilder { num_threads, network, fee_bound, electrumx, wallet_dir, ticker, current }.build()?;
 
 	#[allow(clippy::never_loop)]
 	loop {
@@ -55,19 +58,23 @@ pub async fn run(
 
 #[derive(Debug)]
 struct Miner {
-	thread: u16,
+	num_threads: u16,
 	network: Network,
 	fee_bound: FeeBound,
 	api: ElectrumX,
 	wallets: Vec<Wallet>,
 	ticker: String,
+	current: bool,
 }
 impl Miner {
 	const BASE_BYTES: f64 = 10.5;
 	const INPUT_BYTES_BASE: f64 = 57.5;
 	const LOCK_TIME: LockTime = LockTime::ZERO;
-	// Estimated 8-byte value, with a script size of one byte.
-	// The actual size of the value is determined by the final nonce.
+	// <8 bytes output amount value> + <1 byte len of following script> + <1 byte OP_RETURN(0x6a)>
+	// + <1 byte len indicating the rest> + <10 byte unix_timestamp> + <1 byte for colon separator(:)>
+	// + <8 bytes nonce, roughly estimation>
+	// 8 + 1 + 1 + 1 + 10 + 1 + 8 = 30 bytes
+	// actual op_return output size is determined precisely by final nonce
 	const OP_RETURN_BYTES: f64 = 21. + 8. + 1.;
 	const OUTPUT_BYTES_BASE: f64 = 43.;
 	const REVEAL_INPUT_BYTES_BASE: f64 = 66.;
@@ -126,7 +133,10 @@ impl Miner {
 			value: Amount::from_sat(funding_utxo.value),
 			script_pubkey: funding_spk.clone(),
 		}];
-		let commit_tx = WorkerPool::new("commit", bitworkc, self.thread)
+		let time = util::time();
+		tracing::info!("Starting commit stage mining now...");
+		tracing::info!("Concurrency set to: {}", self.num_threads);
+		let commit_tx = WorkerPool::new("commit", bitworkc.unwrap(), self.num_threads)
 			.activate(
 				(
 					secp.clone(),
@@ -136,7 +146,8 @@ impl Miner {
 					commit_output.clone(),
 					commit_prevouts.clone(),
 				),
-				|(secp, signer, signer_xpk, input, output, prevouts), s| {
+				time,
+				|(secp, signer, signer_xpk, input, output, prevouts), _t, s| {
 					let mut psbt = Psbt::from_unsigned_tx(Transaction {
 						version: Self::VERSION,
 						lock_time: Self::LOCK_TIME,
@@ -156,15 +167,33 @@ impl Miner {
 				},
 			)?
 			.result();
+
 		let commit_txid = commit_tx.txid();
 		let commit_tx_hex = encode::serialize_hex(&commit_tx);
-
 		tracing::info!("broadcasting commit transaction {commit_txid}");
 		tracing::debug!("{commit_tx:#?}");
-		tracing::info!("{commit_tx_hex}");
+		tracing::info!("raw tx: {commit_tx_hex}");
 
-		// TODO?: Handle result.
-		self.api.broadcast(commit_tx_hex).await?;
+		let mut sent_success = false;
+		for _ in self.api.max_retries.clone() {
+			match self.api.broadcast(commit_tx_hex.clone()).await {
+				Ok(_) =>  {
+					sent_success = true;
+					tracing::info!("Successfully sent commit tx {commit_txid}");
+					break;
+				}
+				Err(_) => {
+					tracing::error!("Network error, will retry to broadcast commit transaction in {} seconds...", self.api.retry_period.as_secs());
+					time::sleep(self.api.retry_period).await;
+				}
+			}
+		}
+
+		if !sent_success {
+			tracing::error!("❌ Failed to send commit tx {commit_txid}");
+			return Ok(());
+		}
+		// tracing::info!("Commit workers have completed their tasks for the commit transaction.");
 
 		let commit_txid_ = self
 			.api
@@ -191,8 +220,10 @@ impl Miner {
 		let reveal_tx = if let Some(bitworkr) = bitworkr {
 			let time = util::time();
 
+			tracing::info!("Starting reveal stage mining now...");
+			tracing::info!("Concurrency set to: {}", self.num_threads);
 			// TODO: Update time after attempting all sequences.
-			WorkerPool::new("reveal", bitworkr, self.thread)
+			WorkerPool::new("reveal", bitworkr, self.num_threads)
 				.activate(
 					(
 						secp.clone(),
@@ -202,12 +233,13 @@ impl Miner {
 						commit_output[0].clone(),
 						reveal_psbt.clone(),
 					),
-					move |(secp, signer, script, spend_info, output, psbt), s| {
+					time,
+					move |(secp, signer, script, spend_info, output, psbt), t, s| {
 						let mut psbt = psbt.to_owned();
 
 						psbt.unsigned_tx.output.push(TxOut {
 							value: Amount::ZERO,
-							script_pubkey: util::time_nonce_script(time, s),
+							script_pubkey: util::time_nonce_script(t, s),
 						});
 						psbt.outputs.push(Default::default());
 
@@ -220,6 +252,7 @@ impl Miner {
 				)?
 				.result()
 		} else {
+			// Has no bitworkr
 			sign_reveal_psbt(
 				&secp,
 				&wallet.funding.pair,
@@ -233,21 +266,43 @@ impl Miner {
 			// Remove this clone if not needed in the future.
 			reveal_psbt.clone().extract_tx_unchecked_fee_rate()
 		};
+
 		let reveal_txid = reveal_tx.txid();
 		let reveal_tx_hex = encode::serialize_hex(&reveal_tx);
 
 		tracing::info!("broadcasting reveal transaction {reveal_txid}");
 		tracing::debug!("{reveal_tx:#?}");
-		tracing::info!("{reveal_tx_hex}");
+		tracing::info!("raw tx: {reveal_tx_hex}");
 
-		if let Err(e) = self.api.broadcast(&reveal_tx_hex).await {
-			tracing::error!("failed to broadcast reveal transaction due to {e}");
+		let mut sent_success = false;
+		for _ in self.api.max_retries.clone() {
+			match self.api.broadcast(reveal_tx_hex.clone()).await {
+				Ok(_) =>  {
+					sent_success = true;
+					tracing::info!("✅ Successfully sent reveal tx {reveal_txid}");
+					break;
+				}
+				Err(_) => {
+					tracing::error!("Network error, will retry to broadcast reveal transaction in {} seconds...", self.api.retry_period.as_secs());
+					time::sleep(self.api.retry_period).await;
+				}
+			}
+		}
+
+		if !sent_success {
+			tracing::error!("❌ Failed to send reveal tx {reveal_txid}");
+			tracing::info!("Store the reveal tx in cache for inspection later");
 
 			util::cache(
 				reveal_txid.to_string(),
 				format!("{reveal_tx_hex}\n{reveal_psbt:?}\n{reveal_tx:?}"),
 			)?;
+
+			return Ok(());
 		}
+		// tracing::info!("Reveal workers have completed their tasks for the reveal transaction.");
+		// tracing::info!("✅ Successfully sent reveal tx {reveal_txid}");
+		tracing::info!("✨Congratulations! Mission completed.✨");
 
 		Ok(())
 	}
@@ -270,8 +325,13 @@ impl Miner {
 		if ft.mint_amount == 0 || ft.mint_amount >= 100_000_000 {
 			Err(anyhow::anyhow!("mint amount mismatch"))?;
 		}
+		// if ft.dft_info.mint_count >= ft.max_mints {
+		// 	Err(anyhow::anyhow!("max mints reached"))?;
+		// }
 		if ft.dft_info.mint_count >= ft.max_mints {
-			Err(anyhow::anyhow!("max mints reached"))?;
+			if ft.mint_mode == "fixed" {
+			    Err(anyhow::anyhow!("max mints reached"))?;
+			}
 		}
 
 		let secp = Secp256k1::new();
@@ -284,12 +344,34 @@ impl Miner {
 			value: Amount::from_sat(ft.mint_amount),
 			script_pubkey: wallet.stash.address.script_pubkey(),
 		}];
+
+		let bitworkc = if ft.mint_bitworkc.is_some() {
+			ft.mint_bitworkc.clone()
+		} else if self.current {
+			ft.dft_info.mint_bitworkc_current.clone()
+		} else {
+			ft.dft_info.mint_bitworkc_next.clone()
+		};
+
+		let bitworkr = if ft.mint_bitworkr.is_some() {
+			ft.mint_bitworkr.clone()
+		} else if self.current {
+			ft.dft_info.mint_bitworkr_current.clone()
+		} else {
+			ft.dft_info.mint_bitworkr_next.clone()
+		};
+
 		let payload = PayloadWrapper {
 			args: {
 				let (time, nonce) = util::time_nonce();
+				tracing::info!("payload time: {time}, payload nonce: {nonce}");
+				if ft.mint_mode == "perpetual" || ft.mint_mode == "infinite" {
+					tracing::info!("Minting under perpetual/infinite mode, payload bitworkc: {}", bitworkc.clone().unwrap());
+				}
 
 				Payload {
-					bitworkc: ft.mint_bitworkc.clone(),
+					bitworkc: bitworkc.clone(),
+					bitworkr: bitworkr.clone(),
 					mint_ticker: ft.ticker.clone(),
 					nonce,
 					time,
@@ -304,11 +386,13 @@ impl Miner {
 			.add_leaf(0, reveal_script.clone())?
 			.finalize(&secp, wallet.funding.x_only_public_key)
 			.unwrap();
+		// let has_bitworkr = if ft.mint_bitworkr.is_some() { true } else { false }; // not correct for perpetual mode
+		let has_bitworkr = if bitworkr.is_some() { true } else { false };
 		let fees = Self::fees_of(
 			satsbyte,
 			reveal_script.as_bytes().len(),
 			&additional_outputs,
-			ft.mint_bitworkr.is_some(),
+			has_bitworkr,
 		);
 		let funding_utxo = self
 			.api
@@ -318,8 +402,8 @@ impl Miner {
 		Ok(Data {
 			secp,
 			satsbyte,
-			bitworkc: ft.mint_bitworkc,
-			bitworkr: ft.mint_bitworkr,
+			bitworkc,
+			bitworkr,
 			additional_outputs,
 			reveal_script,
 			reveal_spend_info,
@@ -383,12 +467,13 @@ impl Miner {
 }
 #[derive(Debug)]
 struct MinerBuilder<'a> {
-	thread: u16,
+	num_threads: u16,
 	network: Network,
 	fee_bound: &'a FeeBound,
 	electrumx: &'a str,
 	wallet_dir: &'a Path,
 	ticker: &'a str,
+	current: bool,
 }
 impl<'a> MinerBuilder<'a> {
 	fn build(self) -> Result<Miner> {
@@ -400,12 +485,13 @@ impl<'a> MinerBuilder<'a> {
 			.collect::<Result<_>>()?;
 
 		Ok(Miner {
-			thread: self.thread,
+			num_threads: self.num_threads,
 			network: self.network,
 			fee_bound: self.fee_bound.to_owned(),
 			api,
 			wallets,
 			ticker: self.ticker.into(),
+			current: self.current,
 		})
 	}
 }
@@ -450,9 +536,8 @@ pub struct PayloadWrapper {
 }
 #[derive(Debug, Serialize)]
 pub struct Payload {
-	pub bitworkc: String,
-	// TODO: This field is unnecessary in the current version.
-	// pub bitworkr: Option<String>,
+	pub bitworkc: Option<String>,
+	pub bitworkr: Option<String>,
 	pub mint_ticker: String,
 	pub nonce: u64,
 	pub time: u64,
@@ -462,7 +547,7 @@ pub struct Payload {
 struct Data {
 	secp: Secp256k1<All>,
 	satsbyte: u64,
-	bitworkc: String,
+	bitworkc: Option<String>,
 	bitworkr: Option<String>,
 	additional_outputs: Vec<TxOut>,
 	reveal_script: ScriptBuf,
@@ -481,17 +566,17 @@ struct Fees {
 
 struct WorkerPool {
 	task: &'static str,
-	thread: u16,
+	num_threads: u16,
 	difficulty: String,
 	result: Arc<Mutex<Option<Transaction>>>,
 }
 impl WorkerPool {
-	fn new(task: &'static str, difficulty: String, thread: u16) -> Self {
-		Self { task, difficulty, thread, result: Default::default() }
+	fn new(task: &'static str, difficulty: String, num_threads: u16) -> Self {
+		Self { task, difficulty, num_threads, result: Default::default() }
 	}
 
 	fn sequence_ranges(&self) -> Vec<Range<u32>> {
-		let step = (Sequence::MAX.0 as f32 / self.thread as f32).ceil() as u32;
+		let step = (Sequence::MAX.0 as f32 / self.num_threads as f32).ceil() as u32;
 		let mut ranges = Vec::new();
 		let mut start = 0;
 
@@ -506,10 +591,10 @@ impl WorkerPool {
 		ranges
 	}
 
-	fn activate<P, F>(&self, p: P, f: F) -> Result<&Self>
+	fn activate<P, F>(&self, p: P, t: u64, f: F) -> Result<&Self>
 	where
 		P: 'static + Clone + Send,
-		F: 'static + Clone + Send + Fn(&P, u32) -> Result<Transaction>,
+		F: 'static + Clone + Send + Fn(&P, u64, u32) -> Result<Transaction>,
 	{
 		let task = self.task;
 		let mut ts = <Vec<JoinHandle<Result<()>>>>::new();
@@ -530,10 +615,12 @@ impl WorkerPool {
 						return Ok(());
 					}
 
-					let tx = f(&p, s)?;
+					let tx = f(&p, t, s)?;
 
 					if tx.txid().to_string().trim_start_matches("0x").starts_with(&difficulty) {
 						tracing::info!("solution found for {task}");
+						// tracing::info!("reveal sequence {s}");
+						tracing::info!("solution time: {t}, solution nonce: {s}");
 
 						exit.store(true, Ordering::Relaxed);
 						*result.lock().unwrap() = Some(tx);

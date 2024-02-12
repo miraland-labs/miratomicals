@@ -11,7 +11,7 @@ where
 	Fut: Future<Output = ()>,
 {
 	tracing_subscriber::fmt::init();
-
+	// tracing_subscriber::fmt::try_init();
 	let e = ElectrumXBuilder::testnet().build().unwrap();
 
 	Runtime::new().unwrap().block_on(f(e));

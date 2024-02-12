@@ -40,8 +40,8 @@ pub struct Cli {
 	/// Thread count.
 	///
 	/// This adjusts the number of threads utilized by the Rust engine miner.
-	#[arg(long, value_name = "NUM", default_value_t = num_cpus::get() as u16)]
-	thread: u16,
+	#[arg(long, value_name = "NUM_THREADS", default_value_t = num_cpus::get() as u16)]
+	num_threads: u16,
 	/// Network type.
 	#[arg(value_enum, long, value_name = "NETWORK", default_value_t = Network_::Mainnet)]
 	network: Network_,
@@ -59,16 +59,19 @@ pub struct Cli {
 	/// Ticker of the network to mine on.
 	#[arg(long, value_name = "NAME")]
 	ticker: String,
+	/// Mine with the current actual bitwork otherwise use the next by default.
+	#[arg(long, value_name = "CURRENT")]
+	current: bool,
 }
 impl Cli {
 	pub async fn run(self) -> Result<()> {
-		let Cli { rust_engine, js_engine, thread, network, fee_bound, electrumx, ticker } = self;
+		let Cli { rust_engine, js_engine, num_threads, network, fee_bound, electrumx, ticker, current } = self;
 		let ticker = ticker.to_lowercase();
 
 		if let Some(d) = js_engine {
 			js::run(network.as_atomical_js_network(), &fee_bound, &electrumx, &d, &ticker).await?;
 		} else if let Some(d) = rust_engine {
-			rust::run(thread, network.into(), &fee_bound, &electrumx, &d, &ticker).await?;
+			rust::run(num_threads, network.into(), &fee_bound, &electrumx, &d, &ticker, current).await?;
 		}
 
 		Ok(())

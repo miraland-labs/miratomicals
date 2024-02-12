@@ -1,13 +1,13 @@
 [package]
 authors     = ["Xavier Lau <xavier@inv.cafe>"]
 build       = "build.rs"
-description = "Atomicals mining manager."
+description = "Miraland release of Atomicals mining manager."
 edition     = "2021"
 homepage    = "https://hack.ink/atomicalsir"
 license     = "GPL-3.0"
-name        = "atomicalsir"
+name        = "miratomicals"
 readme      = "README.md"
-repository  = "https://github.com/hack-ink/atomicalsir"
+repository  = "https://github.com/miraland-labs/miratomicals"
 version     = "0.2.0"
 
 [profile.ci-dev]
